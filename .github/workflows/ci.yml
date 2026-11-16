@@ -46,7 +46,7 @@ jobs:
     name: Build & Deploy to ECS Fargate
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && secrets.AWS_ACCESS_KEY_ID != ''
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
       - uses: actions/checkout@v4
