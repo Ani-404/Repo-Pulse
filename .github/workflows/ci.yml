@@ -8,9 +8,16 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  IMAGE_NAME: ghcr.io/ani-404/tiny-mlops
+  ECR_REPOSITORY: repopulse
+  ECS_CLUSTER: repopulse-cluster
+  ECS_SERVICE: repopulse-service
+  ECS_TASK_DEFINITION: task-definition.json
+  CONTAINER_NAME: repopulse-app
 
 jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Run tests on every push and PR
+  # ─────────────────────────────────────────────
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -31,46 +38,53 @@ jobs:
       - name: Run tests
         run: pytest -v
 
+  # ─────────────────────────────────────────────
+  # Job 2: Build image, push to ECR & deploy to ECS Fargate
+  # Runs only on push to main when AWS credentials are set
+  # ─────────────────────────────────────────────
   deploy:
-    name: Build & Deploy
+    name: Build & Deploy to ECS Fargate
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    permissions:
-      contents: read
-      packages: write
-    env:
-      ECS_SERVICE_ARN: ${{ secrets.ECS_SERVICE_ARN }}
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && secrets.AWS_ACCESS_KEY_ID != ''
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image
-        run: |
-          docker build -t "$IMAGE_NAME:latest" -t "$IMAGE_NAME:${GITHUB_SHA}" .
-          docker push "$IMAGE_NAME:latest"
-          docker push "$IMAGE_NAME:${GITHUB_SHA}"
-
       - name: Configure AWS credentials
-        if: env.ECS_SERVICE_ARN != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy to ECS Express Mode
-        if: env.ECS_SERVICE_ARN != ''
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          aws ecs update-express-gateway-service \
-            --region "$AWS_REGION" \
-            --service-arn "$ECS_SERVICE_ARN" \
-            --primary-container "{\"image\":\"$IMAGE_NAME:${GITHUB_SHA}\",\"containerPort\":8000}" \
-            --health-check-path /health
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Render Amazon ECS Task Definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to Amazon ECS Fargate
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
